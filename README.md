@@ -1,0 +1,10 @@
+# surs
+> sudo alternative written in Rust
+## how does surs work?
+- `setuid` syscall
+- the binary needs to be a. set by root and b. have the setuid bit set
+- basically:
+```bash
+chown root:root /path/to/binary
+chmod 4755
+```

@@ -1,0 +1,14 @@
+{
+  "privileges": [
+    {
+      "id": {
+        "group": "wheel"
+      },
+      "password_required": true,
+      "exec_as": "root"
+    }
+  ],
+  "interactive": true,
+  "editor": "nano",
+  "max_attempts": 3
+}
