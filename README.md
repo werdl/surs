@@ -8,3 +8,4 @@
 chown root:root /path/to/binary
 chmod 4755
 ```
+- the Makefile sorts this for you (but ironically uses `sudo` to do so)
