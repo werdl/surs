@@ -1,10 +1,16 @@
-use std::ffi::CString;
+use std::{ffi::CString, fmt::Display};
 
 use crate::result::Result;
 
 /// represents a uid
 #[derive(Debug)]
 pub struct Uid(pub u32);
+
+impl Display for Uid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 use libc::{getgrnam, getpwnam, setgid, setuid};
 
@@ -77,8 +83,14 @@ impl Escalate for Uid {
 }
 
 /// represents a gid
-#[derive(Debug)]
-pub struct Gid(u32);
+#[derive(Debug, Clone)]
+pub struct Gid(pub u32);
+
+impl Display for Gid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 impl Escalate for Gid {
     fn new(gid: u32) -> Self {

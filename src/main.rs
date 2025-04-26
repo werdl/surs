@@ -1,5 +1,7 @@
 use clap::Parser;
-use escalate::{Escalate, Gid};
+use escalate::{Escalate, Gid, Uid};
+use log::{debug, info};
+use parse_opts::{timed_out, update_timeout, Privilege, UserOrGroup};
 use result::Result;
 
 mod escalate;
@@ -19,7 +21,7 @@ mod run;
     target_os = "solaris",
     target_os = "illumos"
 )))]
-compile_error!("surs only works on *nix, as it uses libc functionality");
+compile_surs_error!("surs only works on *nix, as it uses libc functionality");
 
 #[derive(Parser, Debug)]
 struct Opts {
@@ -34,9 +36,9 @@ struct Opts {
     #[clap(short, long)]
     directory: Option<String>,
 
-    /// If set, this will be the editor used to edit the file. The default is $SURS_EDITOR, or $EDITOR, or $VISUAL, or /bin/vi, in that order.
+    /// Should we edit a file (in command). The used editor is the editor specified in the config file, $SURS_EDITOR, $EDITOR, or $VISUAL, in that order. If none of these are set, vi will be used.
     #[clap(short, long)]
-    edit: Option<Option<String>>,
+    edit: bool,
 
     /// Specify the group to run the command as. If a gid is specified, use #<gid>
     #[clap(short, long)]
@@ -74,7 +76,7 @@ struct Opts {
     user: String,
 }
 
-fn escape_prompt(prompt: &str, target_user: &str) -> String {
+fn escape_prompt(prompt: &str, target: String) -> String {
     let mut output = String::new();
 
     let mut i = 0;
@@ -90,7 +92,7 @@ fn escape_prompt(prompt: &str, target_user: &str) -> String {
                         output.push_str(&get_username().unwrap_or_else(|_| "unknown".to_string()));
                     }
                     Some('U') => {
-                        output.push_str(target_user);
+                        output.push_str(&target);
                     }
                     Some('%') => {
                         output.push('%');
@@ -109,18 +111,40 @@ fn escape_prompt(prompt: &str, target_user: &str) -> String {
     output
 }
 
+macro_rules! surs_error {
+    ($msg:expr) => {
+        eprintln!("{}: {}", std::env::args().next().unwrap_or_else(|| "unknown".to_string()), $msg);
+        std::process::exit(1);
+    };
+    ($fmt:expr, $($arg:tt)+) => {
+        eprintln!("{}: {}", std::env::args().next().unwrap_or_else(|| "unknown".to_string()), format!($fmt, $($arg)+));
+        std::process::exit(1);
+    };
+}
+
 fn main() {
+    env_logger::init();
     let opts = Opts::parse();
     let privileges = parse_opts::parse();
 
-    println!("Privileges: {:?}", privileges);
+    if opts.shell.is_none() && opts.command.is_none() {
+        surs_error!("No command specified");
+    }
+
+    debug!("Privileges: {:#?}", privileges);
 
     if privileges.is_err() {
-        println!("Error parsing privileges: {}", privileges.err().unwrap());
+        info!(
+            "Here is an example config file (save it to {}): \n{}",
+            if cfg!(debug_assertions) {
+                "surs.conf.json"
+            } else {
+                "/etc/surs.conf.json"
+            },
+            parse_opts::example()
+        );
 
-        println!("Here is an example config file: {}", parse_opts::example());
-
-        std::process::exit(1);
+        surs_error!("Error parsing privileges: {}", privileges.err().unwrap());
     }
 
     let privileges = privileges.unwrap();
@@ -133,8 +157,7 @@ fn main() {
         if group.starts_with('#') {
             let gid = group[1..].parse::<u32>();
             if gid.is_err() {
-                eprintln!("Invalid GID: {}", gid.err().unwrap());
-                std::process::exit(1);
+                surs_error!("Invalid GID: {}", gid.err().unwrap());
             }
             Some(gid.unwrap())
         } else {
@@ -143,14 +166,12 @@ fn main() {
             let group_cstr = CString::new(group_str).unwrap();
             let group_ptr = unsafe { getgrnam(group_cstr.as_ptr()) };
             if group_ptr.is_null() {
-                eprintln!("Group not found: {}", group_str);
-                std::process::exit(1);
+                surs_error!("Group not found: {}", group_str);
             }
             let group = unsafe { &*group_ptr };
             let gid = group.gr_gid;
             if gid == 0 {
-                eprintln!("Group not found: {}", group_str);
-                std::process::exit(1);
+                surs_error!("Group not found: {}", group_str);
             }
             Some(gid)
         }
@@ -162,25 +183,20 @@ fn main() {
     let user_privileges = privileges
         .privileges
         .iter()
-        .filter(|privilege| {
-            match &privilege.id {
-                parse_opts::UserOrGroup::User(user) => user == &uname,
-                parse_opts::UserOrGroup::Group(group) => {
-                    groups.contains(group)
-                }
-            }
+        .filter(|privilege| match &privilege.perm_owner {
+            parse_opts::UserOrGroup::User(user) => user == &uname,
+            parse_opts::UserOrGroup::Group(group) => groups.contains(group),
         })
         .collect::<Vec<_>>();
 
     if user_privileges.is_empty() {
-        eprintln!("No privileges found for user/group");
-        std::process::exit(1);
+        surs_error!("No privileges found for user/group");
     }
 
     if opts.list {
-        println!("Privileges for user/group:");
+        debug!("Privileges for user/group:");
         for privilege in &user_privileges {
-            println!("{:?}", privilege);
+            debug!("{:#?}", privilege);
         }
         std::process::exit(0);
     }
@@ -190,92 +206,143 @@ fn main() {
     } else if std::env::var("SURS_PROMPT").is_ok() {
         std::env::var("SURS_PROMPT").unwrap()
     } else {
-        privileges.prompt.unwrap_or("[surs]: password for %u: ".to_string())
+        privileges
+            .prompt
+            .unwrap_or("[surs]: password for %u: ".to_string())
     };
 
-    // check if the privilege matches the user
-    let relevant_privilege = user_privileges
+    // check if the privilege matches the user or group
+    let relevant_privileges: Vec<&&Privilege> = user_privileges
         .iter()
-        .find(|privilege| {
-            privilege.exec_as == opts.user
-        });
+        .filter(|privilege| {
+            match &privilege.exec_as {
+                // privilege.exec_as == chosen user
+                parse_opts::UserOrGroup::User(user) => user == &opts.user,
 
-    if relevant_privilege.is_none() {
-        eprintln!("No privileges found for user/group");
-        std::process::exit(1);
+                // privilege.exec_as == chosen group
+                parse_opts::UserOrGroup::Group(group) => {
+                    // get gid from group name
+                    let group_cstr = CString::new(group.as_str()).unwrap();
+                    let group_ptr = unsafe { getgrnam(group_cstr.as_ptr()) };
+                    if group_ptr.is_null() {
+                        surs_error!("Group not found: {}", group);
+                    }
+
+                    let group_struct = unsafe { &*group_ptr };
+                    let gid = group_struct.gr_gid;
+                    if gid == 0 {
+                        surs_error!("Group not found: {:#?}", group);
+                    }
+                    gid == target_group_id.unwrap_or(0)
+                }
+            }
+        })
+        .collect();
+
+    if relevant_privileges.is_empty() {
+        surs_error!("No relevant privileges found for user/group");
     }
 
-    println!(
-        "Relevant privilege found: {:?}",
-        relevant_privilege.unwrap()
-    );
+    // now check we have a privilege for a. user and (if specified) b. group
+    if relevant_privileges
+        .iter()
+        .filter(|privilege| matches!(privilege.exec_as, UserOrGroup::User(_)))
+        .count()
+        == 0
+    {
+        surs_error!("No privileges found for user {}", opts.user);
+    }
 
-    let privilege = relevant_privilege.unwrap();
+    if relevant_privileges
+        .iter()
+        .filter(|privilege| matches!(privilege.exec_as, UserOrGroup::Group(_)))
+        .count()
+        == 0
+        && target_group_id.is_some()
+    {
+        surs_error!(
+            "No privileges found for group {}",
+            opts.group.unwrap()
+        );
+    }
+
+    debug!("Relevant privilege found: {:#?}", relevant_privileges);
+
+    let uid = Uid::from_str(&opts.user);
+    if uid.is_err() {
+        surs_error!("Error getting UID: {}", uid.err().unwrap());
+    }
+    let uid = uid.unwrap();
+
+    let gid = target_group_id.map(Gid::new);
 
     // prompt for password if required
-    if privilege.password_required {
+    if relevant_privileges.iter().any(|p| p.password_required)
+        && (timed_out(
+            parse_opts::UidOrGid::Uid(uid.0),
+            privileges.timeout.unwrap_or(300),
+        )
+        .unwrap_or(false)
+            || {
+                if let Some(gid) = gid.clone() {
+                    timed_out(
+                        parse_opts::UidOrGid::Gid(gid.0),
+                        privileges.timeout.unwrap_or(300),
+                    )
+                    .is_ok()
+                } else {
+                    false
+                }
+            })
+    {
         let mut attempts = 0;
         let max_attempts = privileges.max_attempts.unwrap_or(3);
 
         while attempts < max_attempts {
             let password =
-                rpassword::prompt_password(escape_prompt(&prompt, &privilege.exec_as)).unwrap();
+                rpassword::prompt_password(escape_prompt(&prompt, opts.user.clone())).unwrap();
             if password.is_empty() {
-                eprintln!("No password provided");
+                eprintln!("Sorry, try again.");
+
                 attempts += 1;
                 if attempts == max_attempts {
-                    eprintln!("Maximum attempts reached");
-                    std::process::exit(1);
+                    surs_error!("{} incorrect attempts", max_attempts);
                 }
                 continue;
             }
 
             let uname = get_username().unwrap_or("unknown".to_string());
 
-            let hash = shadow::Shadow::from_name(&uname).unwrap_or_else(|| {
-                eprintln!("Error getting password hash");
-                std::process::exit(1);
-            }).password;
+            let hash = shadow::Shadow::from_name(&uname)
+                .unwrap_or_else(|| {
+                    surs_error!("Error getting password hash");
+                })
+                .password;
 
             if check_password(&password, &hash) {
                 break;
             } else {
-                eprintln!("Incorrect password");
+                eprintln!("Sorry, try again.");
                 attempts += 1;
                 if attempts == max_attempts {
-                    eprintln!("{} incorrect attempts", max_attempts);
-                    std::process::exit(1);
+                    surs_error!("{} incorrect password attempts", max_attempts);
                 }
             }
         }
     }
 
-    println!("Escalating to {}", privilege.exec_as);
-
-    let uid = escalate::Uid::from_str(&privilege.exec_as);
-
-    if uid.is_err() {
-        eprintln!("Error getting UID: {}", uid.err().unwrap());
-        std::process::exit(1);
-    }
-
-    let uid = uid.unwrap();
-
-    if target_group_id.is_some() {
-        let gid = Gid::new(target_group_id.unwrap());
-
-        let res = gid.escalate();
-
-        if res.is_err() {
-            eprintln!("Error setting GID: {}", res.err().unwrap());
-            std::process::exit(1);
-        }
-    }
-
+    debug!("Escalating to user {}", opts.user);
     let res = uid.escalate();
     if res.is_err() {
-        eprintln!("Error setting UID: {}", res.err().unwrap());
-        std::process::exit(1);
+        surs_error!("Error escalating to user: {}", res.err().unwrap());
+    }
+
+    if opts.group.is_some() {
+        debug!("Escalating to group {}", opts.group.unwrap());
+        let res = gid.unwrap().escalate();
+        if res.is_err() {
+            surs_error!("Error escalating to group: {}", res.err().unwrap());
+        }
     }
 
     // set the directory
@@ -283,19 +350,15 @@ fn main() {
         let dir = opts.directory.clone().unwrap();
         let res = std::env::set_current_dir(&dir);
         if res.is_err() {
-            eprintln!("Error setting directory: {}", res.err().unwrap());
-            std::process::exit(1);
+            surs_error!("Error setting directory: {}", res.err().unwrap());
         }
     }
 
     if opts.shell.is_some() {
-        let shell = unsafe {
-            getpwuid(uid.0)
-        };
+        let shell = unsafe { getpwuid(uid.0) };
 
         if shell.is_null() {
-            eprintln!("Error getting shell: {}", std::io::Error::last_os_error());
-            std::process::exit(1);
+            surs_error!("Error getting shell: {}", std::io::Error::last_os_error());
         }
 
         let shell = unsafe { CStr::from_ptr((*shell).pw_shell) }
@@ -312,22 +375,24 @@ fn main() {
             shell
         };
 
-        let args = if opts.login {
-            vec!["-l"]
-        } else {
-            vec![]
-        };
+        let args = if opts.login { vec!["-l"] } else { vec![] };
 
         let res = run::run(&shell, args.as_slice());
         if res.is_err() {
-            eprintln!("Error running shell: {}", res.err().unwrap());
-            std::process::exit(1);
+            surs_error!("Error running shell: {}", res.err().unwrap());
+        }
+
+        let timeout_res = update_timeout(
+            parse_opts::UidOrGid::Uid(uid.0)
+        );
+        if timeout_res.is_err() {
+            surs_error!("Error updating timeout: {}", timeout_res.err().unwrap());
         }
 
         std::process::exit(res.unwrap().code().unwrap_or(1));
-    } else if opts.edit.is_some() {
-        let editor = if opts.edit.clone().unwrap().is_some() {
-            opts.edit.clone().unwrap().unwrap()
+    } else if opts.edit {
+        let editor = if privileges.editor.is_some() {
+            privileges.editor.clone().unwrap()
         } else if std::env::var("SURS_EDITOR").is_ok() {
             std::env::var("SURS_EDITOR").unwrap()
         } else if std::env::var("EDITOR").is_ok() {
@@ -341,8 +406,14 @@ fn main() {
         let file = opts.command.clone().unwrap();
         let res = run::edit(&file, &editor);
         if res.is_err() {
-            eprintln!("Error editing file: {}", res.err().unwrap());
-            std::process::exit(1);
+            surs_error!("Error editing file: {}", res.err().unwrap());
+        }
+
+        let res = update_timeout(
+            parse_opts::UidOrGid::Uid(uid.0)
+        );
+        if res.is_err() {
+            surs_error!("Error updating timeout: {}", res.err().unwrap());
         }
 
         std::process::exit(0);
@@ -350,33 +421,53 @@ fn main() {
         let command = opts.command.clone().unwrap();
         let args = command.split_whitespace().collect::<Vec<_>>();
 
-        let res = run::run_background(&args[0], &args[1..]);
-        if res.is_err() {
-            eprintln!("Error running command: {}", res.err().unwrap());
-            std::process::exit(1);
+        let cmd_res = run::run_background(&args[0], &args[1..]);
+        if cmd_res.is_err() {
+            surs_error!("Error running command: {}", cmd_res.err().unwrap());
         }
 
-        std::process::exit(res.unwrap().wait().unwrap().code().unwrap_or(1));
+        let res = update_timeout(
+            parse_opts::UidOrGid::Uid(uid.0)
+        );
+        if res.is_err() {
+            surs_error!("Error updating timeout: {}", res.err().unwrap());
+        }
+
+        std::process::exit(cmd_res.unwrap().wait().unwrap().code().unwrap_or(1));
     } else if opts.command.is_some() {
         let command = opts.command.clone().unwrap();
         let args = command.split_whitespace().collect::<Vec<_>>();
 
-        let res = run::run(&args[0], &args[1..]);
-        if res.is_err() {
-            eprintln!("Error running command: {}", res.err().unwrap());
-            std::process::exit(1);
+        let cmd_res = run::run(&args[0], &args[1..]);
+        if cmd_res.is_err() {
+            surs_error!("Error running command: {}", cmd_res.err().unwrap());
         }
 
-        std::process::exit(res.unwrap().code().unwrap_or(1));
+        let res = update_timeout(
+            parse_opts::UidOrGid::Uid(uid.0)
+        );
+        if res.is_err() {
+            surs_error!("Error updating timeout: {}", res.err().unwrap());
+        }
+
+        std::process::exit(cmd_res.unwrap().code().unwrap_or(1));
     } else {
         let command = opts.command.clone().unwrap();
         let args = command.split_whitespace().collect::<Vec<_>>();
-        let res = run::run(&args[0], &args[1..]);
-        if res.is_err() {
-            eprintln!("Error running command: {}", res.err().unwrap());
-            std::process::exit(1);
+
+        let cmd_res = run::run(&args[0], &args[1..]);
+        if cmd_res.is_err() {
+            surs_error!("Error running command: {}", cmd_res.err().unwrap());
         }
-        std::process::exit(res.unwrap().code().unwrap_or(1));
+
+        let res = update_timeout(
+            parse_opts::UidOrGid::Uid(uid.0)
+        );
+        if res.is_err() {
+            surs_error!("Error updating timeout: {}", res.err().unwrap());
+        }
+
+        std::process::exit(cmd_res.unwrap().code().unwrap_or(1));
     }
 }
 
@@ -423,8 +514,7 @@ fn get_user_groups() -> Result<Vec<String>> {
             .to_string_lossy()
             .into_owned();
         if group_name.is_empty() {
-            eprintln!("Warning: Group name is empty for GID {}", group);
-            continue;
+            surs_error!("Group name is empty for GID {}", group);
         }
         group_names.push(group_name);
     }
@@ -481,7 +571,9 @@ fn check_password(password: &str, hash: &str) -> bool {
             return false;
         }
 
-        let result_str = std::ffi::CStr::from_ptr(result).to_str().expect("CStr::to_str failed");
+        let result_str = std::ffi::CStr::from_ptr(result)
+            .to_str()
+            .expect("CStr::to_str failed");
         result_str == hash
     }
 }
