@@ -13,3 +13,4 @@ chmod 4755
 - should basically just be like sudo for simple usage
 - for more complex usage, try `--help`
 - also note that a dev build will use `.` as the config file directory
+## why would you use this

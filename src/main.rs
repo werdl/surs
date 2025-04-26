@@ -1,7 +1,7 @@
 use clap::Parser;
 use escalate::{Escalate, Gid, Uid};
 use log::{debug, info};
-use parse_opts::{timed_out, update_timeout, Privilege, UserOrGroup};
+use parse_opts::{Privilege, UserOrGroup, timed_out, update_timeout};
 use result::Result;
 
 mod escalate;
@@ -260,10 +260,7 @@ fn main() {
         == 0
         && target_group_id.is_some()
     {
-        surs_error!(
-            "No privileges found for group {}",
-            opts.group.unwrap()
-        );
+        surs_error!("No privileges found for group {}", opts.group.unwrap());
     }
 
     debug!("Relevant privilege found: {:#?}", relevant_privileges);
@@ -289,7 +286,7 @@ fn main() {
                         parse_opts::UidOrGid::Gid(gid.0),
                         privileges.timeout.unwrap_or(300),
                     )
-                    .is_ok()
+                    .unwrap_or(false)
                 } else {
                     false
                 }
@@ -329,6 +326,69 @@ fn main() {
                 }
             }
         }
+    }
+
+    // now, drop all our groups
+    let res = unsafe { libc::setgroups(0, std::ptr::null_mut()) };
+    if res != 0 {
+        let err = match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EPERM) => "Permission Denied",
+            Some(libc::EINVAL) => "Invalid GID",
+            Some(e) => &format!("Unknown Error: {}", e),
+            None => "Unknown Error",
+        };
+        surs_error!("Error dropping groups: {}", err);
+    }
+
+    // set the groups that user is part of by using getgrouplist
+    let mut groups: Vec<gid_t> = vec![];
+    let mut ngroups = groups.len() as i32;
+    let res = unsafe {
+        libc::getgrouplist(
+            CString::new(opts.user.clone()).unwrap().as_ptr(),
+            uid.0,
+            groups.as_mut_ptr(),
+            &mut ngroups,
+        )
+    };
+    if res == -1 { // unless there are zero groups, *ngroups will be set to the number of groups
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EPERM) => {
+                surs_error!("Permission Denied");
+            }
+            Some(libc::EINVAL) => {
+                surs_error!("Invalid GID");
+            }
+            Some(0) | None => {
+                groups = vec![0; ngroups as usize];
+                let res = unsafe {
+                    libc::getgrouplist(
+                        CString::new(opts.user.clone()).unwrap().as_ptr(),
+                        uid.0,
+                        groups.as_mut_ptr(),
+                        &mut ngroups,
+                    )
+                };
+                if res == -1 {
+                    surs_error!("Error getting groups: {}", std::io::Error::last_os_error());
+                }
+            }
+            Some(e) => {
+                surs_error!("Unknown Error: {}", e);
+            }
+        };
+    }
+
+    // now set the groups
+    let res = unsafe { libc::setgroups(ngroups as usize, groups.as_ptr()) };
+    if res != 0 {
+        let err = match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EPERM) => "Permission Denied",
+            Some(libc::EINVAL) => "Invalid GID",
+            Some(e) => &format!("Unknown Error: {}", e),
+            None => "Unknown Error",
+        };
+        surs_error!("Error setting groups: {}", err);
     }
 
     debug!("Escalating to user {}", opts.user);
@@ -382,11 +442,18 @@ fn main() {
             surs_error!("Error running shell: {}", res.err().unwrap());
         }
 
-        let timeout_res = update_timeout(
-            parse_opts::UidOrGid::Uid(uid.0)
-        );
+        let timeout_res = update_timeout(parse_opts::UidOrGid::Uid(uid.0));
         if timeout_res.is_err() {
             surs_error!("Error updating timeout: {}", timeout_res.err().unwrap());
+        }
+
+        let group_timeout_res = if let Some(gid) = gid {
+            update_timeout(parse_opts::UidOrGid::Gid(gid.0))
+        } else {
+            Ok(())
+        };
+        if group_timeout_res.is_err() {
+            surs_error!("Error updating group timeout: {}", group_timeout_res.err().unwrap());
         }
 
         std::process::exit(res.unwrap().code().unwrap_or(1));
@@ -409,11 +476,18 @@ fn main() {
             surs_error!("Error editing file: {}", res.err().unwrap());
         }
 
-        let res = update_timeout(
-            parse_opts::UidOrGid::Uid(uid.0)
-        );
+        let res = update_timeout(parse_opts::UidOrGid::Uid(uid.0));
         if res.is_err() {
             surs_error!("Error updating timeout: {}", res.err().unwrap());
+        }
+
+        let group_timeout_res = if let Some(gid) = gid {
+            update_timeout(parse_opts::UidOrGid::Gid(gid.0))
+        } else {
+            Ok(())
+        };
+        if group_timeout_res.is_err() {
+            surs_error!("Error updating group timeout: {}", group_timeout_res.err().unwrap());
         }
 
         std::process::exit(0);
@@ -426,11 +500,18 @@ fn main() {
             surs_error!("Error running command: {}", cmd_res.err().unwrap());
         }
 
-        let res = update_timeout(
-            parse_opts::UidOrGid::Uid(uid.0)
-        );
+        let res = update_timeout(parse_opts::UidOrGid::Uid(uid.0));
         if res.is_err() {
             surs_error!("Error updating timeout: {}", res.err().unwrap());
+        }
+
+        let group_timeout_res = if let Some(gid) = gid {
+            update_timeout(parse_opts::UidOrGid::Gid(gid.0))
+        } else {
+            Ok(())
+        };
+        if group_timeout_res.is_err() {
+            surs_error!("Error updating group timeout: {}", group_timeout_res.err().unwrap());
         }
 
         std::process::exit(cmd_res.unwrap().wait().unwrap().code().unwrap_or(1));
@@ -443,11 +524,18 @@ fn main() {
             surs_error!("Error running command: {}", cmd_res.err().unwrap());
         }
 
-        let res = update_timeout(
-            parse_opts::UidOrGid::Uid(uid.0)
-        );
+        let res = update_timeout(parse_opts::UidOrGid::Uid(uid.0));
         if res.is_err() {
             surs_error!("Error updating timeout: {}", res.err().unwrap());
+        }
+
+        let group_timeout_res = if let Some(gid) = gid {
+            update_timeout(parse_opts::UidOrGid::Gid(gid.0))
+        } else {
+            Ok(())
+        };
+        if group_timeout_res.is_err() {
+            surs_error!("Error updating group timeout: {}", group_timeout_res.err().unwrap());
         }
 
         std::process::exit(cmd_res.unwrap().code().unwrap_or(1));
@@ -460,11 +548,18 @@ fn main() {
             surs_error!("Error running command: {}", cmd_res.err().unwrap());
         }
 
-        let res = update_timeout(
-            parse_opts::UidOrGid::Uid(uid.0)
-        );
+        let res = update_timeout(parse_opts::UidOrGid::Uid(uid.0));
         if res.is_err() {
             surs_error!("Error updating timeout: {}", res.err().unwrap());
+        }
+
+        let group_timeout_res = if let Some(gid) = gid {
+            update_timeout(parse_opts::UidOrGid::Gid(gid.0))
+        } else {
+            Ok(())
+        };
+        if group_timeout_res.is_err() {
+            surs_error!("Error updating group timeout: {}", group_timeout_res.err().unwrap());
         }
 
         std::process::exit(cmd_res.unwrap().code().unwrap_or(1));

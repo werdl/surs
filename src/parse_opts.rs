@@ -76,6 +76,7 @@ pub fn example() -> String {
     serde_json::to_string_pretty(&ex).unwrap()
 }
 
+#[derive(Copy, Clone)]
 pub enum UidOrGid {
     Uid(u32),
     Gid(u32),

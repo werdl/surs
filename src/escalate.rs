@@ -3,7 +3,7 @@ use std::{ffi::CString, fmt::Display};
 use crate::result::Result;
 
 /// represents a uid
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct Uid(pub u32);
 
 impl Display for Uid {
@@ -83,7 +83,7 @@ impl Escalate for Uid {
 }
 
 /// represents a gid
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Gid(pub u32);
 
 impl Display for Gid {
